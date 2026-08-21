@@ -1,199 +1,212 @@
-from pathlib import Path
-import time
-
-from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
 import streamlit as st
+import sys
+import os
+from pathlib import Path
 
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-DEFAULT_MODEL = "gpt-5"
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 1.5
+from file_parser import parse_uploaded_file
+from openai_api import run_gap_analysis, stream_proposal
+from docx_generator import markdown_to_docx
 
+# ── 페이지 설정
+st.set_page_config(
+    page_title="기술이전 제안서 시스템",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def load_prompt(filename: str) -> str:
-    path = PROMPTS_DIR / filename
-    return path.read_text(encoding="utf-8")
+st.markdown("""
+<style>
+    .main-title { font-size:1.6rem; font-weight:700; color:#1F497D; margin-bottom:0.2rem; }
+    .sub-title { font-size:0.9rem; color:#666; margin-bottom:1.5rem; }
+    .step-badge { display:inline-block; background:#2E75B6; color:white; border-radius:50%;
+        width:28px; height:28px; text-align:center; line-height:28px;
+        font-weight:bold; font-size:0.85rem; margin-right:8px; }
+    .step-header { font-size:1.05rem; font-weight:600; color:#1F497D; margin:1rem 0 0.5rem 0; }
+    .info-box { background:#EEF4FB; border-left:4px solid #2E75B6;
+        padding:0.8rem 1rem; border-radius:4px; font-size:0.88rem; margin:0.5rem 0; }
+    .warning-box { background:#FFF8E1; border-left:4px solid #FFA000;
+        padding:0.8rem 1rem; border-radius:4px; font-size:0.88rem; margin:0.5rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
+# ── API Key: Streamlit Secrets에서 로드 (Manage app > Secrets 에 기입)
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except (KeyError, FileNotFoundError):
+    api_key = ""
 
-def _get_model() -> str:
-    return st.secrets.get("OPENAI_MODEL", DEFAULT_MODEL)
+# API Key가 없으면 앱 전체를 차단
+if not api_key:
+    st.error("⚠️ API Key가 설정되지 않았습니다. Streamlit Cloud의 **Manage app > Secrets**에 아래 형식으로 입력해주세요.")
+    st.code('OPENAI_API_KEY = "sk-..."\nOPENAI_MODEL = "gpt-5"', language="toml")
+    st.stop()
 
+# ── 사이드바
+with st.sidebar:
+    st.markdown("### ⚙️ 설정")
+    st.divider()
+    st.success("API Key 로드 완료", icon="✅")
 
-def _web_search_tools(ir_text: str) -> list[dict]:
-    if ir_text.strip():
-        return []
-    return [{"type": "web_search_preview"}]
+    st.divider()
+    proposal_type = st.radio("제안서 유형", ["티저형 (2~3페이지)", "정식형 (8~10페이지)"],
+        help="티저형: 첫 컨택용 / 정식형: 미팅 후 심층 검토용")
+    proposal_type_key = "티저형" if "티저형" in proposal_type else "정식형"
 
+    st.divider()
+    company_name = st.text_input("수요기업명", placeholder="예: ㈜센디")
 
-def _is_transient_error(error: Exception) -> bool:
-    return isinstance(error, (APIConnectionError, APIError, APITimeoutError, RateLimitError))
+    st.divider()
+    st.markdown("##### 📌 단계별 안내")
+    st.markdown("1. **자료 업로드** — 특허 명세서 + IR\n2. **갭 진단 확인** — 초안 수정 후 승인\n3. **제안서 생성** — 다운로드")
+    st.divider()
+    st.caption("© 산학협력단 기술이전팀\nPowered by OpenAI")
 
+# ── 메인
+st.markdown('<div class="main-title">📄 기술이전 제안서 시스템</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">특허 명세서와 수요기업 정보를 업로드하면 AI가 맞춤형 제안서를 자동 생성합니다.</div>', unsafe_allow_html=True)
 
-def _is_web_search_unsupported(error: BadRequestError) -> bool:
-    message = str(error).lower()
-    return "web_search" in message or "tool" in message
+for key in ["patent_text", "ir_text", "gap_draft", "proposal_md", "step"]:
+    if key not in st.session_state:
+        st.session_state[key] = "" if key != "step" else 1
 
+# STEP 1
+st.markdown('<div class="step-header"><span class="step-badge">1</span>자료 업로드</div>', unsafe_allow_html=True)
+col1, col2 = st.columns(2)
 
-def _extract_output_text(response) -> str:
-    """Responses API 응답에서 텍스트를 최대한 안정적으로 추출."""
-    output_text = getattr(response, "output_text", "")
-    if output_text:
-        return output_text.strip()
+with col1:
+    patent_file = st.file_uploader("특허 명세서 *필수", type=["docx","pdf"], key="patent_upload")
+    if patent_file:
+        text = parse_uploaded_file(patent_file)
+        if text:
+            st.session_state.patent_text = text
+            st.success(f"✅ 파싱 완료 — {len(text):,}자 추출")
+            with st.expander("추출된 텍스트 미리보기"):
+                st.text(text[:800] + "..." if len(text) > 800 else text)
 
-    chunks = []
-    for item in getattr(response, "output", []) or []:
-        for content in getattr(item, "content", []) or []:
-            text = getattr(content, "text", None)
-            if text:
-                chunks.append(text)
+with col2:
+    ir_file = st.file_uploader("수요기업 IR 자료 (선택)", type=["docx","pdf"], key="ir_upload")
+    if ir_file:
+        text = parse_uploaded_file(ir_file)
+        if text:
+            st.session_state.ir_text = text
+            st.success(f"✅ 파싱 완료 — {len(text):,}자 추출")
+    else:
+        st.markdown('<div class="info-box">IR 자료가 없으면 OpenAI가 공개 정보를 기반으로 추론합니다. "(추정)" 표기가 적용됩니다.</div>', unsafe_allow_html=True)
 
-    return "\n".join(chunks).strip()
+st.divider()
 
+# STEP 2
+st.markdown('<div class="step-header"><span class="step-badge">2</span>기업 분석 및 갭 진단 확인</div>', unsafe_allow_html=True)
 
-def _incomplete_reason(response) -> str:
-    incomplete_details = getattr(response, "incomplete_details", None)
-    return getattr(incomplete_details, "reason", "") if incomplete_details else ""
+can_analyze = bool(st.session_state.patent_text and company_name)
+if not can_analyze:
+    missing = []
+    if not st.session_state.patent_text: missing.append("특허 명세서")
+    if not company_name: missing.append("수요기업명 (사이드바)")
+    st.markdown(f'<div class="warning-box">다음 항목을 먼저 입력해주세요: {", ".join(missing)}</div>', unsafe_allow_html=True)
 
+col_btn1, _ = st.columns([1, 5])
+with col_btn1:
+    analyze_btn = st.button("🔍 갭 진단 생성", disabled=not can_analyze, use_container_width=True)
 
-def _create_with_retries(client: OpenAI, create_kwargs: dict):
-    use_tools = bool(create_kwargs.get("tools"))
+if analyze_btn and can_analyze:
+    try:
+        draft = run_gap_analysis(api_key=api_key, patent_text=st.session_state.patent_text,
+                                  company_name=company_name, ir_text=st.session_state.ir_text)
+        st.session_state.gap_draft = draft
+        st.session_state.step = 2
+    except Exception as e:
+        st.error(f"갭 진단 생성 중 오류: {e}")
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            return client.responses.create(**create_kwargs)
-        except BadRequestError as error:
-            if use_tools and _is_web_search_unsupported(error):
-                create_kwargs = dict(create_kwargs)
-                create_kwargs.pop("tools", None)
-                use_tools = False
-                st.warning("웹 검색 도구를 사용할 수 없어, 업로드된 자료와 입력값만으로 다시 시도합니다.")
-                continue
-            raise
-        except Exception as error:
-            if not _is_transient_error(error) or attempt == MAX_RETRIES - 1:
-                raise
-            time.sleep(RETRY_BASE_DELAY * (2**attempt))
+if st.session_state.gap_draft:
+    st.markdown("**📝 갭 진단 초안** — 내용을 직접 수정한 후 승인하세요.")
+    edited_gap = st.text_area(label="갭 진단 편집", value=st.session_state.gap_draft,
+                               height=200, label_visibility="collapsed")
+    st.session_state.gap_draft = edited_gap
 
+    col_a, _ = st.columns([1, 5])
+    with col_a:
+        if st.button("✅ 이 방향으로 제안서 작성", type="primary", use_container_width=True):
+            st.session_state.step = 3
+            st.rerun()
 
-def run_gap_analysis(api_key, patent_text, company_name, ir_text) -> str:
-    system_prompt = load_prompt("gap_analysis.txt")
-    ir_section = ir_text.strip() if ir_text.strip() else "없음. 공개 정보 기반으로 추론해주세요."
-    user_message = f"""특허 명세서:\n{patent_text}\n\n수요기업명: {company_name}\n\n수요기업 IR/정보:\n{ir_section}\n\n위 정보를 바탕으로 갭 진단 초안을 작성해주세요.\n다음 세 가지를 순서대로 포함하세요:\n1. 수요기업의 현재 강점 (1~2문장)\n2. 확인되는 기술 공백 (2~3문장, 구체적으로)\n3. 본 기술이 이 공백을 어떻게 메우는지 (1~2문장)"""
+st.divider()
 
-    client = OpenAI(api_key=api_key)
-    create_kwargs = {
-        "model": _get_model(),
-        "instructions": system_prompt,
-        "input": [{"role": "user", "content": user_message}],
-        "max_output_tokens": 3000,
-    }
-    tools = _web_search_tools(ir_text)
-    if tools:
-        create_kwargs["tools"] = tools
+# STEP 3
+st.markdown('<div class="step-header"><span class="step-badge">3</span>제안서 생성</div>', unsafe_allow_html=True)
 
-    with st.spinner("갭 진단 분석 중..."):
-        response = _create_with_retries(client, create_kwargs)
-    output_text = _extract_output_text(response)
-    if not output_text:
-        reason = _incomplete_reason(response)
-        if reason == "max_output_tokens":
-            raise RuntimeError("AI 응답이 출력 토큰 한도에 걸렸습니다. OPENAI_MODEL을 gpt-5-mini로 바꾸거나 잠시 후 다시 시도해주세요.")
-        raise RuntimeError("AI 응답이 비어 있습니다. 모델 설정 또는 입력 자료 길이를 확인한 뒤 다시 시도해주세요.")
-    return output_text
+can_generate = st.session_state.step >= 3 and bool(st.session_state.gap_draft)
+if not can_generate:
+    st.markdown('<div class="info-box">Step 2에서 갭 진단을 승인하면 제안서 생성이 활성화됩니다.</div>', unsafe_allow_html=True)
+else:
+    st.markdown(f'<div class="info-box">승인된 갭 진단을 기반으로 <b>{proposal_type_key} 제안서</b>를 생성합니다. — 수요기업: <b>{company_name}</b></div>', unsafe_allow_html=True)
 
+    col_g1, _ = st.columns([1, 5])
+    with col_g1:
+        generate_btn = st.button("🚀 제안서 생성 시작", type="primary", use_container_width=True)
 
-def stream_proposal(
-    api_key,
-    proposal_type,
-    patent_text,
-    company_name,
-    ir_text,
-    approved_gap,
-    max_continuations=3,
-):
-    """
-    제안서를 스트리밍으로 생성한다.
+    if generate_btn:
+        st.session_state.proposal_md = ""
+        full_text = ""
 
-    정식형(8~10페이지, 5개 섹션 + 참고문헌)은 한 번의 호출로 끝까지 생성되지
-    않을 수 있으므로, max_output_tokens로 잘린 경우 이전 응답을 이어받아
-    최대 max_continuations회까지 자동으로 이어쓴다.
-    """
-    prompt_file = "teaser.txt" if proposal_type == "티저형" else "formal.txt"
-    system_prompt = load_prompt(prompt_file)
-    ir_section = ir_text.strip() if ir_text.strip() else "없음 (공개 정보 기반 추론 적용)"
-    type_kr = "티저형 제안서" if proposal_type == "티저형" else "정식 제안보고서"
-    gap_section = "SECTION 2의 핵심 진단" if proposal_type == "티저형" else "03섹션 핵심 진단 및 갭 분석표"
-    user_message = f"""특허 명세서:\n{patent_text}\n\n수요기업명: {company_name}\n\n수요기업 IR/정보:\n{ir_section}\n\n[확정된 갭 진단 - 사용자 승인 완료]:\n{approved_gap}\n\n위 정보를 바탕으로 {type_kr}를 작성해주세요.\n갭 진단 내용을 {gap_section}에 반영하세요."""
+        # 진행 상황 표시 (세부 내용 대신 단계별 메시지만)
+        progress_bar = st.progress(0)
+        status_msg = st.empty()
 
-    client = OpenAI(api_key=api_key)
-    max_tokens = 4000 if proposal_type == "티저형" else 8000
-    continuation_max_tokens = 4000
-    tools = _web_search_tools(ir_text)
-
-    input_messages = [{"role": "user", "content": user_message}]
-    previous_response_id = None
-    continuations_used = 0
-
-    while True:
-        current_max_tokens = max_tokens if continuations_used == 0 else continuation_max_tokens
-        stream_kwargs = {
-            "model": _get_model(),
-            "instructions": system_prompt,
-            "input": input_messages,
-            "max_output_tokens": current_max_tokens,
-        }
-        if previous_response_id:
-            stream_kwargs["previous_response_id"] = previous_response_id
-        if tools:
-            stream_kwargs["tools"] = tools
-
-        yielded_this_response = False
-        for attempt in range(MAX_RETRIES):
-            yielded_this_attempt = False
-            try:
-                with client.responses.stream(**stream_kwargs) as stream:
-                    for event in stream:
-                        if event.type == "response.output_text.delta":
-                            yielded_this_attempt = True
-                            yielded_this_response = True
-                            yield event.delta
-
-                    final_response = stream.get_final_response()
-                break
-            except BadRequestError as error:
-                if tools and "tools" in stream_kwargs and _is_web_search_unsupported(error):
-                    stream_kwargs = dict(stream_kwargs)
-                    stream_kwargs.pop("tools", None)
-                    tools = []
-                    st.warning("웹 검색 도구를 사용할 수 없어, 업로드된 자료와 입력값만으로 다시 시도합니다.")
-                    continue
-                raise
-            except Exception as error:
-                if yielded_this_attempt or not _is_transient_error(error) or attempt == MAX_RETRIES - 1:
-                    raise
-                time.sleep(RETRY_BASE_DELAY * (2**attempt))
-        else:
-            raise RuntimeError("AI 응답 생성에 실패했습니다. 잠시 후 다시 시도해주세요.")
-
-        if not yielded_this_response:
-            raise RuntimeError("AI 응답이 비어 있습니다. 잠시 후 다시 시도해주세요.")
-
-        previous_response_id = final_response.id
-        incomplete_details = getattr(final_response, "incomplete_details", None)
-        reason = getattr(incomplete_details, "reason", None)
-
-        if reason != "max_output_tokens" or continuations_used >= max_continuations:
-            break
-
-        continuations_used += 1
-        input_messages = [
-            {
-                "role": "user",
-                "content": (
-                    "출력이 중간에 잘렸습니다. 처음부터 다시 쓰지 말고, "
-                    "직전에 중단된 지점 바로 다음부터 자연스럽게 이어서 작성해주세요. "
-                    "남은 섹션(참고문헌 포함)까지 끝까지 작성해야 합니다."
-                ),
-            }
+        steps = [
+            (10, "📋 특허 명세서 분석 중..."),
+            (30, "🏢 수요기업 정보 검토 중..."),
+            (50, "🔍 갭 진단 내용 반영 중..."),
+            (70, "✍️ 제안서 본문 작성 중..."),
+            (90, "📎 문서 구조 정리 중..."),
         ]
+        step_idx = 0
+        char_thresholds = [200, 600, 1200, 2000, 3000]
+
+        try:
+            for chunk in stream_proposal(api_key=api_key, proposal_type=proposal_type_key,
+                patent_text=st.session_state.patent_text, company_name=company_name,
+                ir_text=st.session_state.ir_text, approved_gap=st.session_state.gap_draft):
+                full_text += chunk
+
+                # 글자 수 기준으로 진행 단계 업데이트
+                if step_idx < len(steps) and len(full_text) >= char_thresholds[step_idx]:
+                    progress_bar.progress(steps[step_idx][0])
+                    status_msg.markdown(f"**{steps[step_idx][1]}**")
+                    step_idx += 1
+
+            progress_bar.progress(100)
+            status_msg.markdown("**✅ 제안서 생성 완료!**")
+            st.session_state.proposal_md = full_text
+
+        except Exception as e:
+            progress_bar.empty()
+            status_msg.empty()
+            st.error(f"제안서 생성 중 오류: {e}")
+
+    if st.session_state.proposal_md:
+        st.divider()
+        st.markdown("#### 📥 다운로드")
+        try:
+            docx_bytes = markdown_to_docx(st.session_state.proposal_md)
+            st.download_button(
+                label="📝 Word (.docx) 다운로드",
+                data=docx_bytes,
+                file_name=f"기술이전제안서_{company_name}_{proposal_type_key}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=False,
+            )
+        except Exception as e:
+            st.error(f"DOCX 변환 오류: {e}")
+
+        st.divider()
+        if st.button("🔄 처음부터 다시 시작"):
+            for key in ["patent_text","ir_text","gap_draft","proposal_md"]:
+                st.session_state[key] = ""
+            st.session_state.step = 1
+            st.rerun()
