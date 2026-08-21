@@ -35,6 +35,27 @@ def _is_web_search_unsupported(error: BadRequestError) -> bool:
     return "web_search" in message or "tool" in message
 
 
+def _extract_output_text(response) -> str:
+    """Responses API 응답에서 텍스트를 최대한 안정적으로 추출."""
+    output_text = getattr(response, "output_text", "")
+    if output_text:
+        return output_text.strip()
+
+    chunks = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if text:
+                chunks.append(text)
+
+    return "\n".join(chunks).strip()
+
+
+def _incomplete_reason(response) -> str:
+    incomplete_details = getattr(response, "incomplete_details", None)
+    return getattr(incomplete_details, "reason", "") if incomplete_details else ""
+
+
 def _create_with_retries(client: OpenAI, create_kwargs: dict):
     use_tools = bool(create_kwargs.get("tools"))
 
@@ -65,7 +86,7 @@ def run_gap_analysis(api_key, patent_text, company_name, ir_text) -> str:
         "model": _get_model(),
         "instructions": system_prompt,
         "input": [{"role": "user", "content": user_message}],
-        "max_output_tokens": 1000,
+        "max_output_tokens": 3000,
     }
     tools = _web_search_tools(ir_text)
     if tools:
@@ -73,9 +94,13 @@ def run_gap_analysis(api_key, patent_text, company_name, ir_text) -> str:
 
     with st.spinner("갭 진단 분석 중..."):
         response = _create_with_retries(client, create_kwargs)
-    if not response.output_text.strip():
-        raise RuntimeError("AI 응답이 비어 있습니다. 잠시 후 다시 시도해주세요.")
-    return response.output_text
+    output_text = _extract_output_text(response)
+    if not output_text:
+        reason = _incomplete_reason(response)
+        if reason == "max_output_tokens":
+            raise RuntimeError("AI 응답이 출력 토큰 한도에 걸렸습니다. OPENAI_MODEL을 gpt-5-mini로 바꾸거나 잠시 후 다시 시도해주세요.")
+        raise RuntimeError("AI 응답이 비어 있습니다. 모델 설정 또는 입력 자료 길이를 확인한 뒤 다시 시도해주세요.")
+    return output_text
 
 
 def stream_proposal(
