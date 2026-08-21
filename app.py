@@ -1,6 +1,5 @@
 import streamlit as st
 import sys
-import os
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -21,16 +20,15 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .main-title { font-size:1.6rem; font-weight:700; color:#1F497D; margin-bottom:0.2rem; }
-    .sub-title { font-size:0.9rem; color:#666; margin-bottom:1.5rem; }
+    .main-title { font-size:1.55rem; font-weight:700; color:#1F497D; margin-bottom:0.15rem; }
+    .sub-title { font-size:0.9rem; color:#666; margin-bottom:1.1rem; }
     .step-badge { display:inline-block; background:#2E75B6; color:white; border-radius:50%;
-        width:28px; height:28px; text-align:center; line-height:28px;
+        width:24px; height:24px; text-align:center; line-height:24px;
         font-weight:bold; font-size:0.85rem; margin-right:8px; }
-    .step-header { font-size:1.05rem; font-weight:600; color:#1F497D; margin:1rem 0 0.5rem 0; }
-    .info-box { background:#EEF4FB; border-left:4px solid #2E75B6;
-        padding:0.8rem 1rem; border-radius:4px; font-size:0.88rem; margin:0.5rem 0; }
+    .step-header { font-size:1.02rem; font-weight:600; color:#1F497D; margin:1.2rem 0 0.55rem 0; }
     .warning-box { background:#FFF8E1; border-left:4px solid #FFA000;
-        padding:0.8rem 1rem; border-radius:4px; font-size:0.88rem; margin:0.5rem 0; }
+        padding:0.65rem 0.85rem; border-radius:4px; font-size:0.86rem; margin:0.4rem 0; }
+    .small-note { color:#666; font-size:0.82rem; margin-top:0.25rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -48,27 +46,15 @@ if not api_key:
 
 # ── 사이드바
 with st.sidebar:
-    st.markdown("### ⚙️ 설정")
-    st.divider()
-    st.success("API Key 로드 완료", icon="✅")
-
-    st.divider()
+    st.markdown("### 설정")
+    company_name = st.text_input("수요기업명", placeholder="예: ㈜센디")
     proposal_type = st.radio("제안서 유형", ["티저형 (2~3페이지)", "제안형 (6~8페이지)"],
         help="티저형: 미팅 전 첫 컨택용 / 제안형: 미팅 후 적용 가능성 심층 검토용")
     proposal_type_key = "티저형" if "티저형" in proposal_type else "제안형"
 
-    st.divider()
-    company_name = st.text_input("수요기업명", placeholder="예: ㈜센디")
-
-    st.divider()
-    st.markdown("##### 📌 단계별 안내")
-    st.markdown("1. **자료 업로드** — 특허 명세서 + 기업자료\n2. **적합성 확인** — 제안 방향 수정 후 승인\n3. **제안서 생성** — 다운로드")
-    st.divider()
-    st.caption("© 산학협력단 기술이전팀\nPowered by OpenAI")
-
 # ── 메인
-st.markdown('<div class="main-title">📄 수요기업 맞춤형 기술이전 제안서 시스템</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">SMK 검토 이후, 특정 수요기업에 대한 기술 적용 가능성과 제안 방향을 분석하여 맞춤형 제안서를 생성합니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">수요기업 맞춤형 기술이전 제안서</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">특허와 수요기업 정보를 바탕으로 제안 방향을 정리하고 Word 제안서를 생성합니다.</div>', unsafe_allow_html=True)
 
 for key in ["patent_text", "ir_text", "fit_draft", "proposal_md", "step"]:
     if key not in st.session_state:
@@ -84,9 +70,7 @@ with col1:
         text = parse_uploaded_file(patent_file)
         if text:
             st.session_state.patent_text = text
-            st.success(f"✅ 파싱 완료 — {len(text):,}자 추출")
-            with st.expander("추출된 텍스트 미리보기"):
-                st.text(text[:800] + "..." if len(text) > 800 else text)
+            st.success(f"파싱 완료 · {len(text):,}자")
 
 with col2:
     ir_file = st.file_uploader("수요기업 자료 (선택)", type=["docx","pdf"], key="ir_upload")
@@ -94,11 +78,9 @@ with col2:
         text = parse_uploaded_file(ir_file)
         if text:
             st.session_state.ir_text = text
-            st.success(f"✅ 파싱 완료 — {len(text):,}자 추출")
+            st.success(f"파싱 완료 · {len(text):,}자")
     else:
-        st.markdown('<div class="info-box">기업자료가 없으면 공식 홈페이지, 보도자료, 공시·기업정보 등 공개자료를 우선 활용합니다. 확인되지 않은 내용에는 "(공개자료 기반 추정)" 또는 "추가 확인 필요" 표기가 적용됩니다.</div>', unsafe_allow_html=True)
-
-st.divider()
+        st.markdown('<div class="small-note">기업자료가 없으면 공개자료 기반으로 작성합니다.</div>', unsafe_allow_html=True)
 
 # STEP 2
 st.markdown('<div class="step-header"><span class="step-badge">2</span>기업 적합성 및 제안 방향 확인</div>', unsafe_allow_html=True)
@@ -108,11 +90,9 @@ if not can_analyze:
     missing = []
     if not st.session_state.patent_text: missing.append("특허 명세서")
     if not company_name: missing.append("수요기업명 (사이드바)")
-    st.markdown(f'<div class="warning-box">다음 항목을 먼저 입력해주세요: {", ".join(missing)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="warning-box">필요 항목: {", ".join(missing)}</div>', unsafe_allow_html=True)
 
-col_btn1, _ = st.columns([1, 5])
-with col_btn1:
-    analyze_btn = st.button("🔍 적합성 분석 생성", disabled=not can_analyze, use_container_width=True)
+analyze_btn = st.button("적합성 분석 생성", disabled=not can_analyze, use_container_width=False)
 
 if analyze_btn and can_analyze:
     try:
@@ -124,31 +104,25 @@ if analyze_btn and can_analyze:
         st.error(f"적합성 분석 생성 중 오류: {e}")
 
 if st.session_state.fit_draft:
-    st.markdown("**📝 적합성 분석 및 제안 방향 초안** — 내용을 직접 수정한 후 승인하세요.")
-    edited_fit = st.text_area(label="적합성 분석 편집", value=st.session_state.fit_draft,
-                               height=200, label_visibility="collapsed")
-    st.session_state.fit_draft = edited_fit
+    with st.expander("분석 결과 보기/수정", expanded=True):
+        edited_fit = st.text_area(label="적합성 분석 편집", value=st.session_state.fit_draft,
+                                  height=180, label_visibility="collapsed")
+        st.session_state.fit_draft = edited_fit
 
-    col_a, _ = st.columns([1, 5])
-    with col_a:
-        if st.button("✅ 이 방향으로 제안서 작성", type="primary", use_container_width=True):
-            st.session_state.step = 3
-            st.rerun()
-
-st.divider()
+    if st.button("이 방향으로 제안서 작성", type="primary", use_container_width=False):
+        st.session_state.step = 3
+        st.rerun()
 
 # STEP 3
 st.markdown('<div class="step-header"><span class="step-badge">3</span>제안서 생성</div>', unsafe_allow_html=True)
 
 can_generate = st.session_state.step >= 3 and bool(st.session_state.fit_draft)
 if not can_generate:
-    st.markdown('<div class="info-box">Step 2에서 적합성 분석을 승인하면 제안서 생성이 활성화됩니다.</div>', unsafe_allow_html=True)
+    st.caption("적합성 분석을 승인하면 생성 버튼이 활성화됩니다.")
 else:
-    st.markdown(f'<div class="info-box">승인된 제안 방향을 기반으로 <b>{proposal_type_key} 제안서</b>를 생성합니다. — 수요기업: <b>{company_name}</b></div>', unsafe_allow_html=True)
+    st.caption(f"{company_name} · {proposal_type_key}")
 
-    col_g1, _ = st.columns([1, 5])
-    with col_g1:
-        generate_btn = st.button("🚀 제안서 생성 시작", type="primary", use_container_width=True)
+    generate_btn = st.button("제안서 생성", type="primary", use_container_width=False)
 
     if generate_btn:
         st.session_state.proposal_md = ""
@@ -159,14 +133,13 @@ else:
         status_msg = st.empty()
 
         steps = [
-            (10, "📋 특허 명세서 분석 중..."),
-            (30, "🏢 수요기업 정보 검토 중..."),
-            (50, "🔍 적합성 분석 내용 반영 중..."),
-            (70, "✍️ 제안서 본문 작성 중..."),
-            (90, "📎 문서 구조 정리 중..."),
+            (10, "자료 분석 중..."),
+            (35, "제안 방향 반영 중..."),
+            (70, "제안서 작성 중..."),
+            (90, "문서 정리 중..."),
         ]
         step_idx = 0
-        char_thresholds = [200, 600, 1200, 2000, 3000]
+        char_thresholds = [200, 900, 1800, 3000]
 
         try:
             for chunk in generate_proposal_chunks(api_key=api_key, proposal_type=proposal_type_key,
@@ -181,7 +154,7 @@ else:
                     step_idx += 1
 
             progress_bar.progress(100)
-            status_msg.markdown("**✅ 제안서 생성 완료!**")
+            status_msg.markdown("**제안서 생성 완료**")
             st.session_state.proposal_md = full_text
 
         except Exception as e:
@@ -191,11 +164,11 @@ else:
 
     if st.session_state.proposal_md:
         st.divider()
-        st.markdown("#### 📥 다운로드")
+        st.markdown("#### 다운로드")
         try:
             docx_bytes = markdown_to_docx(st.session_state.proposal_md)
             st.download_button(
-                label="📝 Word (.docx) 다운로드",
+                label="Word (.docx) 다운로드",
                 data=docx_bytes,
                 file_name=f"기술이전제안서_{company_name}_{proposal_type_key}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -204,8 +177,7 @@ else:
         except Exception as e:
             st.error(f"DOCX 변환 오류: {e}")
 
-        st.divider()
-        if st.button("🔄 처음부터 다시 시작"):
+        if st.button("처음부터 다시 시작"):
             for key in ["patent_text","ir_text","fit_draft","proposal_md"]:
                 st.session_state[key] = ""
             st.session_state.step = 1
